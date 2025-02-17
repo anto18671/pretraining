@@ -217,19 +217,19 @@ class PretrainModel(LightningModule):
 
 # Load the pretraining data
 def load_pretraining_data():
-    # Load dataset as an ImageFolder
-    dataset = load_dataset(
-        "imagefolder",
-        split=["train", "val"],
-        streaming=True,
-        data_files={
-            "train": os.path.join(os.getenv("HOME_DATASETS"), "imagenet21k-p/train/**/*"),
-            "val": os.path.join(os.getenv("HOME_DATASETS"), "imagenet21k-p/val/**/*")
-        },
-    )
+    # Define dataset paths
+    data_path = os.path.join(os.getenv("HOME_DATASETS"), "imagenet21k-p-arrow")
+
+    # Make paths for train and validation
+    train_path = os.path.join(data_path, "train")
+    val_path = os.path.join(data_path, "validation")
+    
+    # Load dataset from disk
+    train_dataset = load_from_disk(train_path)
+    val_dataset = load_from_disk(val_path)
 
     # Dynamically determine the number of classes
-    num_classes = dataset['train'].features['label'].num_classes
+    num_classes = train_dataset.features['label'].num_classes
 
     # Print the number of classes
     print(f"Number of classes in dataset: {num_classes}")
@@ -255,14 +255,14 @@ def load_pretraining_data():
     
     # Create training dataset
     train_dataset = PretrainingDataset(
-        dataset['train'],
+        train_dataset,
         train_transform,
         num_classes,
     )
     
     # Create validation dataset
     val_dataset = PretrainingDataset(
-        dataset['val'],
+        val_dataset,
         val_transform,
         num_classes,
     )
