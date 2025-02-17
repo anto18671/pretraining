@@ -3,7 +3,7 @@ from timm.models.resnet import ResNet, BasicBlock
 from torch.utils.data import DataLoader, Dataset
 from torchmetrics.classification import Accuracy
 from albumentations.pytorch import ToTensorV2
-from datasets import load_dataset
+from datasets import load_from_disk
 from torch.nn import Module
 import numpy as np
 import mlflow
