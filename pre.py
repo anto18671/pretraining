@@ -3,8 +3,6 @@ from torch.utils.data import DataLoader, Dataset
 from torchmetrics.classification import Accuracy
 from albumentations.pytorch import ToTensorV2
 from timm import create_model
-from torch.nn import Module
-from itertools import count
 from torch import nn
 import mlflow
 import torch
@@ -14,38 +12,79 @@ import os
 
 # Import albumentations
 from albumentations import (
+    Resize, VerticalFlip, ToGray, Affine, RandomGamma, PlanckianJitter,
     Compose, HorizontalFlip, Normalize, ColorJitter,
-    PadIfNeeded, VerticalFlip, ToGray, Affine,
+    Resize, GaussNoise, MotionBlur,
 )
 
-# Define the CustomModel class that builds the backbone model for classification
-class CustomModel(Module):
-    # Initialize the CustomModel with number of classes and dropout rate
+# Define the CustomModel
+class CustomModel(nn.Module):
+    # Initializes the model
     def __init__(self, num_classes):
-        # Call the parent class initializer
-        super(CustomModel, self).__init__()
-        # Create backbone model
-        self.backbone = create_model(
-            'lcnet_035',
+        super().__init__()
+        # Initialize EfficientViT model
+        self.efficientvit = create_model(
+            'efficientvit_b2.r288_in1k',
+            num_classes=num_classes,
             pretrained=True,
-            num_classes=0,
-            drop_rate=0.5
+        )
+        
+        # Ablate specific blocks
+        self.ablate_stage(0, [])
+        self.ablate_stage(1, [])
+        self.ablate_stage(2, [3, 4])
+        self.ablate_stage(3, [0, 1, 2, 3, 4, 5, 6])
+
+        # Replace the head with a custom head
+        self.efficientvit.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(start_dim=1, end_dim=-1),
+            nn.Linear(192, 576, bias=False),
+            nn.LayerNorm((576,), eps=1e-5, elementwise_affine=True),
+            nn.Hardswish(),
+            nn.Dropout(p=0.1, inplace=False),
+            nn.Linear(576, 2400, bias=True),
         )
 
-        # Replace backbone convolution head.
-        self.backbone.conv_head = nn.Conv2d(192, 384, kernel_size=(1, 1), stride=(1, 1))
-
-        # Replace backbone classifier to output the desired number of points.
-        self.backbone.classifier = nn.Linear(in_features=384, out_features=num_classes, bias=True)
-
-    # Define the forward pass of the model
-    def forward(self, x):
-        # Pass the input through the backbone and return the output
-        return self.backbone(x)
+    # Remove the and head
+    def remove_head(self):
+        # Delete the head from the model
+        del self.efficientvit.head
     
-# Creates a warmup and exponential scheduler with an optional cycling element
+    # Ablate specific blocks in a stage
+    def ablate_stage(self, stage_idx, block_indices):
+        # Get the stage
+        stage = self.efficientvit.stages[stage_idx]
+
+        # Convert the blocks to a list
+        blocks = list(stage.blocks)
+
+        # Print the number of blocks before ablation
+        print(f"Stage {stage_idx} - Blocks before ablation: {len(blocks)}")
+
+        # Remove blocks in reverse order
+        for index in sorted(block_indices, reverse=True):
+            del blocks[index]
+
+        # Print the number of blocks after ablation
+        print(f"Stage {stage_idx} - Blocks after ablation: {len(blocks)}")
+
+        # Check if no blocks are left
+        if len(blocks) == 0:
+            # Remove the stage if no blocks are left
+            del self.efficientvit.stages[stage_idx]
+
+        # Update the blocks
+        stage.blocks = nn.Sequential(*blocks)
+
+    # Forward method
+    def forward(self, x):
+        # Return the features from the backbone
+        return self.efficientvit(x)
+    
+# Define a warmup and exponential scheduler with an optional cycling element
 class WarmupExponentialLR:
-# Initializes instance with optimizer, decay factor, warmup steps, cycle frequency, and cycle amplitude
+    # Initialize scheduler with optimizer, decay factor, warmup steps, cycle frequency, and cycle amplitude
     def __init__(self, optimizer, decay_factor, warmup_steps=0, cycle_frequency=1, cycle_amplitude=0.0):
         # Store the optimizer
         self.optimizer = optimizer
@@ -62,172 +101,166 @@ class WarmupExponentialLR:
         # Store the cycle amplitude
         self.cycle_amplitude = cycle_amplitude
 
-        # Create a step counter
-        self.current_step_counter = count(1)
+        # Initialize the current step counter
+        self.current_step = 0
 
         # Loop over parameter groups in the optimizer
         for param_group in self.optimizer.param_groups:
-            # Set initial_lr if not already present
+            # Set the initial learning rate if not already present
             param_group.setdefault('initial_lr', param_group['lr'])
-
-    # Updates the learning rate at each step
+    
+    # Update the learning rate at each step
     def step(self):
-        # Get the current step
-        step = next(self.current_step_counter)
+        # Increment the current step counter
+        self.current_step += 1
 
-        # Compute the new learning rate
-        lr = self.get_lr(step)
+        # Compute the new learning rate based on the current step
+        lr = self.get_lr(self.current_step)
 
         # Loop over parameter groups in the optimizer
         for param_group in self.optimizer.param_groups:
             # Update the learning rate in the parameter group
             param_group['lr'] = lr
-
-    # Computes the learning rate based on warmup, exponential decay, and cycling
+    
+    # Compute the learning rate based on warmup, exponential decay, and cycling
     def get_lr(self, step):
-        # Get the initial learning rate from the first parameter group
+        # Retrieve the initial learning rate from the first parameter group
         initial_lr = self.optimizer.param_groups[0]['initial_lr']
 
-        # Check if the current step is within warmup
+        # Check if the current step is within the warmup period
         if step <= self.warmup_steps:
-            # Compute progress fraction during warmup
+            # Calculate the progress fraction during warmup
             progress = step / self.warmup_steps
 
-            # Compute a cosine-based schedule during warmup
+            # Calculate the cosine-based warmup learning rate
             base_lr = initial_lr * 0.5 * (1 + math.cos(math.pi * (1 - progress)))
         else:
-            # Determine how many steps have passed after warmup
+            # Calculate the number of steps after warmup
             decay_steps = step - self.warmup_steps
 
             # Apply exponential decay after warmup
             base_lr = initial_lr * (self.decay_factor ** decay_steps)
 
-        # Compute a sine-based cycling factor
+        # Compute the sine-based cycling factor
         cycle_factor = 1 + self.cycle_amplitude * math.sin(2 * math.pi * step / self.cycle_frequency)
 
         # Return the final learning rate including the cycling component
         return base_lr * cycle_factor
+    
+    # Return the current state of the scheduler as a dictionary
+    def state_dict(self):
+        # Return the state dictionary containing the current step
+        return {'current_step': self.current_step}
+    
+    # Load the scheduler state from a state dictionary
+    def load_state_dict(self, state):
+        # Set the current step from the provided state dictionary
+        self.current_step = state.get('current_step', 0)
 
 # Define a class for structured progressive unfreezing of the model block-by-block
 class FeatureExtractorTrainer(LightningModule):
     # Initialize with a model, number of classes, and total batches
-    def __init__(self, model, num_classes, num_batches):
+    def __init__(self, model, num_classes, num_batches, unfreeze_steps=2048):
         # Call the parent class initializer
         super().__init__()
         # Store the model reference
         self.model = model
-        
+
+        # Store unfreeze steps
+        self.unfreeze_steps = unfreeze_steps
+
+        # Freeze all parameters of the feature extractor
+        for param in self.model.efficientvit.parameters():
+            param.requires_grad = False
+
+        # Unfreeze parameters of the head only
+        for param in self.model.efficientvit.head.parameters():
+            param.requires_grad = True
+
         # Define the loss function as CrossEntropyLoss
         self.criterion = torch.nn.CrossEntropyLoss()
-        
-        # Define the optimizer as SGD with specified learning rate and weight decay
-        self.optimizer = torch.optim.SGD(
+
+        # Define the optimizer as AdamW with model parameters
+        self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            weight_decay=1e-4,
-            lr=1e-2,
+            weight_decay=2.5e-4,
+            lr=1e-4,
         )
 
         # Calculate decay factor for exponential decay
         decay_factor = 0.88 ** (1 / num_batches)
-        
+
         # Define the learning rate scheduler with warmup and exponential decay
         self.scheduler = WarmupExponentialLR(
             self.optimizer,
             decay_factor=decay_factor,
-            warmup_steps=512,
+            warmup_steps=4096,
             cycle_frequency=512,
             cycle_amplitude=1/3,
         )
-        
+
         # Initialize the training accuracy metric for multiclass classification
         self.train_accuracy = Accuracy(
             task="multiclass",
             num_classes=num_classes,
         )
-        
+
         # Initialize the validation accuracy metric for multiclass classification
         self.val_accuracy = Accuracy(
             task="multiclass",
             num_classes=num_classes,
         )
-        
-        # Store all layers for progressive unfreezing
-        self.layers = self.get_layers()
-        
-        # Store the total number of layers
-        self.total_layers = len(self.layers)
-        
-        # Start with all layers frozen
-        self.freeze_all_layers()
 
-    # Retrieve all layers from the model and store them in order
-    def get_layers(self):
-        # Extracts all layers from the model backbone
-        return [getattr(self.model.backbone, layer_name) for layer_name in ["layer1", "layer2", "layer3", "layer4"]]
-
-    # Freeze all layers initially
-    def freeze_all_layers(self):
-        # Freeze all parameters in each layer
-        for layer in self.layers:
-            for param in layer.parameters():
-                param.requires_grad = False
-        
-        # Print a message indicating that all layers have been frozen
-        print("All layers frozen...")
-
-    # Unfreeze one layer per epoch
-    def on_train_epoch_start(self):
-        # Determine the layer to unfreeze based on the current epoch
-        if self.current_epoch < self.total_layers:
-            
-            # Print the layer being unfrozen
-            print(f"Unfreezing layer {self.current_epoch + 1}...")
-            
-            # Unfreeze the layer for the current epoch
-            layer_to_unfreeze = self.layers[self.current_epoch]
-            for param in layer_to_unfreeze.parameters():
+    # Define a hook to update parameter freezing based on training steps
+    def on_train_batch_start(self, batch, batch_idx, dataloader_idx=0):
+        # Check if the current global step has reached the target number of steps
+        if self.global_step == self.unfreeze_steps:
+            # Unfreeze all parameters of the feature extractor
+            for param in self.model.efficientvit.parameters():
                 param.requires_grad = True
 
     # Define the training step executed during each training iteration
     def training_step(self, batch, batch_idx):
         # Unpack the batch into images and targets
         images, targets = batch
-        
+
         # Compute model outputs from the images
         outputs = self.model(images)
-        
+
         # Calculate the loss between outputs and targets using CrossEntropyLoss
         loss = self.criterion(outputs, targets)
-        
+
         # Determine the predicted classes by taking the argmax of outputs
         preds = torch.argmax(outputs, dim=1)
-        
+
         # Calculate the accuracy for the training batch
         acc = self.train_accuracy(preds, targets)
-        
+
         # Retrieve the current learning rate from the optimizer
         lr = self.optimizers().param_groups[0]['lr']
-        
+
         # Log the training loss in the progress bar without using a logger
         self.log("train_loss", loss, prog_bar=True, logger=False)
-        
+
         # Log the training accuracy in the progress bar without using a logger
         self.log("train_acc", acc, prog_bar=True, logger=False)
-        
+
         # Log the current learning rate in the progress bar without using a logger
         self.log("lr", lr, prog_bar=True, logger=False)
-        
+
         # Log the training loss to MLflow with the current batch index as step
         mlflow.log_metric("train_loss", loss.item(), step=batch_idx)
-        
+
         # Log the training accuracy to MLflow with the current batch index as step
         mlflow.log_metric("train_acc", acc.item(), step=batch_idx)
         
-        # Update the learning rate scheduler after each training step
-        self.lr_schedulers().step()
-        
         # Return the computed loss for backpropagation
         return loss
+
+    # Override the LightningModule lr_scheduler_step hook for custom scheduler stepping
+    def lr_scheduler_step(self, scheduler, optimizer_idx):
+        # Call the custom scheduler's step function to update the learning rate
+        scheduler.step()
 
     # Save the model at the start of each validation epoch
     def on_validation_epoch_start(self):
@@ -238,28 +271,28 @@ class FeatureExtractorTrainer(LightningModule):
     def validation_step(self, batch, batch_idx):
         # Unpack the batch into images and targets
         images, targets = batch
-        
+
         # Compute model outputs from the images
         outputs = self.model(images)
-        
+
         # Calculate the loss between outputs and targets using CrossEntropyLoss
         loss = self.criterion(outputs, targets)
-        
+
         # Determine the predicted classes by taking the argmax of outputs
         preds = torch.argmax(outputs, dim=1)
-        
+
         # Calculate the accuracy for the validation batch
         acc = self.val_accuracy(preds, targets)
-        
+
         # Log the validation loss in the progress bar without using a logger
         self.log("val_loss", loss, prog_bar=True, logger=False)
-        
+
         # Log the validation accuracy in the progress bar without using a logger
         self.log("val_acc", acc, prog_bar=True, logger=False)
-        
+
         # Log the validation loss to MLflow with the current batch index as step
         mlflow.log_metric("val_loss", loss.item(), step=batch_idx)
-        
+
         # Log the validation accuracy to MLflow with the current batch index as step
         mlflow.log_metric("val_acc", acc.item(), step=batch_idx)
         
@@ -322,49 +355,86 @@ def load_pretraining_data():
     train_transform = Compose([
         # Flip transformations
         HorizontalFlip(p=0.5),
-        VerticalFlip(p=0.25),
+        VerticalFlip(p=0.5),
 
         # Apply one of the following transformations randomly
         ColorJitter(
-            brightness=0.325,
-            contrast=0.325,
-            saturation=0.325,
-            hue=0.0325,
-            p=1.0
+            brightness=0.25,
+            contrast=0.25,
+            saturation=0.25,
+            hue=0.025,
+            p=1.0,
+        ),
+
+        # Random gamma correction
+        RandomGamma(
+            gamma_limit=(92.5, 107.5),
+            p=0.5,
+        ),
+
+        # Visual transform with special effects
+        PlanckianJitter(
+            mode="cied",
+            temperature_limit=(5000,8000),
+            sampling_method="gaussian",
+            p=0.5,
+        ),
+
+        # Apply Gaussian noise
+        GaussNoise(
+            std_range=(0.0, 0.02),
+            p=0.25,
+        ),
+
+        # Apply motion blur
+        MotionBlur(
+            blur_limit=(3, 9),
+            allow_shifted=True,
+            p=0.25,
         ),
 
         # Convert the image to grayscale
         ToGray(p=0.1),
 
-        # Resize the image with padding when needed
-        PadIfNeeded(224, 224, border_mode=0),
-
         # Spatial transformations
         Affine(
-            translate_percent=(0.0, 0.2),
-            scale=(0.8, 1.2),
-            rotate=(-30.0, 30.0),
-            shear=(-15.0, 15.0),
+            translate_percent=(0.0, 0.125),
+            scale=(0.825, 1.1),
+            rotate=(-25.0, 25.0),
+            shear=(-12.5, 12.2),
             p=1.0,
         ),
 
         # Normalize the image with mean and standard deviation
-        Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+
+        # Resize the image to a fixed size
+        Resize(448, 448),
+
+        # Convert the image to PyTorch tensor format
         ToTensorV2(),
     ])
 
     # Define the transformation pipeline for validation data using albumentations
     val_transform = Compose([
-        # Resize the image with padding when needed
-        PadIfNeeded(224, 224, border_mode=0),
-
         # Normalize the image with mean and standard deviation
-        Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+        Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+
+        # Resize the image to a fixed size
+        Resize(448, 448),
+
+        # Convert the image to PyTorch tensor format
         ToTensorV2(),
     ])
 
     # Construct the base path for datasets using the HOME_DATASETS environment variable
-    data_path = os.path.join(os.getenv("HOME_DATASETS"), "imagenet600")
+    data_path = os.path.join(os.getenv("HOME_DATASETS"), "imagenet2_4k")
 
     # Get the sorted class names and create a consistent class-to-index mapping
     class_names = sorted(os.listdir(os.path.join(data_path, "train")))
@@ -393,8 +463,8 @@ def load_pretraining_data():
     # Create a DataLoader for the training dataset with specified batch size and workers
     train_loader = DataLoader(
         train_dataset,
-        batch_size=256,
-        num_workers=16,
+        batch_size=60,
+        num_workers=6,
         shuffle=True,
         persistent_workers=True,
     )
@@ -402,8 +472,8 @@ def load_pretraining_data():
     # Create a DataLoader for the validation dataset with specified batch size and workers
     val_loader = DataLoader(
         val_dataset,
-        batch_size=256,
-        num_workers=4,
+        batch_size=60,
+        num_workers=3,
         shuffle=False,
         persistent_workers=True,
     )
@@ -415,9 +485,6 @@ def load_pretraining_data():
 def main():
     # Enable benchmark mode for cudnn to improve performance
     torch.backends.cudnn.benchmark = True
-
-    # Set the precision for fp32 matrix multiplication to medium
-    torch.set_float32_matmul_precision("medium")
 
     # Set the experiment name for MLflow logging
     experiment_name = "Custom model pretraining"
@@ -450,10 +517,11 @@ def main():
     # Initialize the Trainer with specified parameters for epochs, accelerator, and logging
     trainer = Trainer(
         max_epochs=16,
+        precision="bf16-mixed",
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        log_every_n_steps=512,
         enable_checkpointing=False,
         enable_progress_bar=True,
+        log_every_n_steps=512,
         logger=False,
     )
 
