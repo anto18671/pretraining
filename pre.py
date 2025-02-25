@@ -25,7 +25,7 @@ class CustomModel(nn.Module):
         # Initialize EfficientViT model
         self.efficientvit = create_model(
             'efficientvit_b2.r288_in1k',
-            num_classes=num_classes,
+            num_classes=0,
             pretrained=True,
         )
         
@@ -43,7 +43,7 @@ class CustomModel(nn.Module):
             nn.LayerNorm((576,), eps=1e-5, elementwise_affine=True),
             nn.Hardswish(),
             nn.Dropout(p=0.1, inplace=False),
-            nn.Linear(576, 2400, bias=True),
+            nn.Linear(576, num_classes, bias=True),
         )
 
     # Remove the and head
@@ -363,7 +363,7 @@ def load_pretraining_data():
             contrast=0.25,
             saturation=0.25,
             hue=0.025,
-            p=1.0,
+            p=0.975,
         ),
 
         # Random gamma correction
@@ -402,7 +402,7 @@ def load_pretraining_data():
             scale=(0.825, 1.1),
             rotate=(-25.0, 25.0),
             shear=(-12.5, 12.2),
-            p=1.0,
+            p=0.975,
         ),
 
         # Normalize the image with mean and standard deviation
@@ -412,7 +412,7 @@ def load_pretraining_data():
         ),
 
         # Resize the image to a fixed size
-        Resize(448, 448),
+        Resize(336, 336),
 
         # Convert the image to PyTorch tensor format
         ToTensorV2(),
@@ -427,14 +427,14 @@ def load_pretraining_data():
         ),
 
         # Resize the image to a fixed size
-        Resize(448, 448),
+        Resize(336, 336),
 
         # Convert the image to PyTorch tensor format
         ToTensorV2(),
     ])
 
     # Construct the base path for datasets using the HOME_DATASETS environment variable
-    data_path = os.path.join(os.getenv("HOME_DATASETS"), "imagenet2_4k")
+    data_path = os.path.join(os.getenv("HOME_DATASETS"), "imagenet2k")
 
     # Get the sorted class names and create a consistent class-to-index mapping
     class_names = sorted(os.listdir(os.path.join(data_path, "train")))
@@ -463,18 +463,20 @@ def load_pretraining_data():
     # Create a DataLoader for the training dataset with specified batch size and workers
     train_loader = DataLoader(
         train_dataset,
-        batch_size=60,
-        num_workers=6,
+        batch_size=32,
+        num_workers=8,
         shuffle=True,
+        drop_last=True,
         persistent_workers=True,
     )
 
     # Create a DataLoader for the validation dataset with specified batch size and workers
     val_loader = DataLoader(
         val_dataset,
-        batch_size=60,
-        num_workers=3,
+        batch_size=32,
+        num_workers=2,
         shuffle=False,
+        drop_last=True,
         persistent_workers=True,
     )
 
@@ -517,9 +519,9 @@ def main():
     # Initialize the Trainer with specified parameters for epochs, accelerator, and logging
     trainer = Trainer(
         max_epochs=16,
-        precision="bf16-mixed",
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         enable_checkpointing=False,
+        accumulate_grad_batches=4,
         enable_progress_bar=True,
         log_every_n_steps=512,
         logger=False,
